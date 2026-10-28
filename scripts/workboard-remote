@@ -1,0 +1,123 @@
+#!/bin/bash
+# Workboard CLI for a machine that does not host the board: forwards every call over SSH
+# to the board host. Configure in ~/.config/workboard/config.env:
+#   WB_BOARD_HOST=<ssh host of the machine with board.json>
+#   WB_BOARD_DIR=<path to agent-workboard on that host>   (no spaces)
+#   WB_MACHINE=<this machine's id in board.json machines>
+set -euo pipefail
+
+CONFIG="${WB_CONFIG:-$HOME/.config/workboard/config.env}"
+# shellcheck disable=SC1090
+[[ -f "$CONFIG" ]] && source "$CONFIG"
+: "${WB_BOARD_HOST:?set WB_BOARD_HOST in $CONFIG}"
+: "${WB_BOARD_DIR:?set WB_BOARD_DIR in $CONFIG}"
+MACHINE="${WB_MACHINE:-$(hostname -s)}"
+REMOTE_PY="python3 ${WB_BOARD_DIR%/}/scripts/workboard.py"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8)
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+
+wake_env_prefix=""
+
+compute_wake_env_prefix() {
+  local raw="" encoded="" herdr_bin
+  if [[ -n "${HERDR_PANE_ID:-}" ]]; then
+    herdr_bin="$(command -v herdr || echo "$HOME/.local/bin/herdr")"
+    raw="$("$herdr_bin" agent get "$HERDR_PANE_ID" 2>/dev/null || true)"
+  fi
+  encoded="$(WB_HERDR_RAW="$raw" WB_MACHINE_ID="$MACHINE" python3 -c '
+import base64, json, os
+env = os.environ
+handle = None
+try:
+    info = json.loads(env.get("WB_HERDR_RAW") or "{}").get("result", {}).get("agent")
+except ValueError:
+    info = None
+if isinstance(info, dict):
+    session = info.get("agent_session")
+    handle = {"kind": info.get("agent"), "pane_id": info.get("pane_id"), "workspace_id": info.get("workspace_id"),
+              "terminal_id": info.get("terminal_id"), "session_id": session.get("value") if isinstance(session, dict) else None,
+              "cwd": info.get("cwd")}
+elif env.get("HERDR_PANE_ID"):
+    kind = "cursor" if env.get("CURSOR_AGENT") == "1" else "codex" if any(k.startswith("CODEX_") for k in env) else "claude" if env.get("CLAUDECODE") == "1" else None
+    handle = {"kind": kind, "pane_id": env["HERDR_PANE_ID"], "workspace_id": env.get("HERDR_WORKSPACE_ID"), "terminal_id": None,
+              "session_id": env.get("CURSOR_CONVERSATION_ID") if kind == "cursor" else None, "cwd": os.getcwd()}
+elif env.get("CURSOR_AGENT") == "1" and env.get("CURSOR_CONVERSATION_ID"):
+    handle = {"kind": "cursor", "pane_id": None, "workspace_id": None, "terminal_id": None, "session_id": env["CURSOR_CONVERSATION_ID"], "cwd": os.getcwd()}
+elif env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID"):
+    handle = {"kind": "codex", "pane_id": None, "workspace_id": None, "terminal_id": None,
+              "session_id": env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID"), "cwd": os.getcwd()}
+if handle:
+    handle["machine"] = env["WB_MACHINE_ID"]
+    print(base64.b64encode(json.dumps(handle, separators=(",", ":")).encode()).decode())
+' 2>/dev/null || true)"
+  if [[ -n "$encoded" ]]; then
+    wake_env_prefix="WB_WAKE_HANDLE=$(printf '%q' "$encoded")"
+  fi
+}
+
+remote_run() {
+  local args="" a
+  for a in "$@"; do
+    args+=" $(printf '%q' "$a")"
+  done
+  local remote_cmd="$REMOTE_PY$args"
+  if [[ -n "$wake_env_prefix" ]]; then
+    remote_cmd="$wake_env_prefix $remote_cmd"
+  fi
+  ssh -n "${SSH_OPTS[@]}" "$WB_BOARD_HOST" "$remote_cmd"
+}
+
+cleanup_remote_tmp=""
+cleanup_local_tmp=""
+cleanup() {
+  if [[ -n "$cleanup_remote_tmp" ]]; then
+    ssh -n "${SSH_OPTS[@]}" "$WB_BOARD_HOST" "rm -rf $(printf '%q' "$cleanup_remote_tmp")" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$cleanup_local_tmp" ]]; then
+    rm -rf "$cleanup_local_tmp" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+compute_wake_env_prefix
+
+# attach takes a local file: convert it here (--pdf), copy it to the board host, attach there.
+if [[ "${1:-}" != "attach" || "$#" -lt 3 ]]; then
+  remote_run "$@"
+  exit $?
+fi
+
+card_id="$2"
+local_file="$3"
+shift 3
+
+if [[ ! -f "$local_file" ]]; then
+  echo "workboard: file not found: $local_file" >&2
+  exit 1
+fi
+
+filtered=()
+use_pdf=0
+for arg in "$@"; do
+  if [[ "$arg" == "--pdf" ]]; then
+    use_pdf=1
+    continue
+  fi
+  filtered+=("$arg")
+done
+
+upload_file="$local_file"
+if [[ "$use_pdf" -eq 1 ]]; then
+  cleanup_local_tmp="$(mktemp -d /tmp/workboard-upload-local-XXXXXX)"
+  stem="$(basename "$local_file")"
+  stem="${stem%.*}"
+  upload_file="$cleanup_local_tmp/${stem:-attachment}.pdf"
+  "$HERE/md2pdf" "$local_file" "$upload_file"
+fi
+
+cleanup_remote_tmp="/tmp/workboard-upload-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+remote_file="${cleanup_remote_tmp}/$(basename "$upload_file")"
+ssh -n "${SSH_OPTS[@]}" "$WB_BOARD_HOST" "mkdir -p $(printf '%q' "$cleanup_remote_tmp")"
+scp -q "$upload_file" "$WB_BOARD_HOST:$remote_file"
+
+remote_run attach "$card_id" "$remote_file" ${filtered[@]+"${filtered[@]}"}

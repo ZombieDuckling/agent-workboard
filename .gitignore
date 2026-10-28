@@ -1,0 +1,20 @@
+# Board data: private, never commit
+/board.json
+/board.json.*
+/snapshots.json
+/BOARD.md
+/debt.json
+/wakes.json
+/notify_state.json
+/attachments/
+*.tmp
+/.lock
+/.wakes.lock
+/wake.lock
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "updated_at": "2026-01-01T00:00:00Z",
+  "columns": [
+    {
+      "id": "backlog",
+      "title": "Backlog"
+    },
+    {
+      "id": "ready",
+      "title": "Ready"
+    },
+    {
+      "id": "in_progress",
+      "title": "In progress"
+    },
+    {
+      "id": "blocked",
+      "title": "Blocked"
+    },
+    {
+      "id": "review",
+      "title": "Review"
+    },
+    {
+      "id": "done",
+      "title": "Done"
+    }
+  ],
+  "machines": [
+    {
+      "id": "laptop",
+      "title": "Laptop",
+      "ssh": null,
+      "icon": "laptop"
+    },
+    {
+      "id": "buildbox",
+      "title": "Build box",
+      "ssh": "buildbox",
+      "icon": "server"
+    }
+  ],
+  "projects": [
+    {
+      "id": "workboard",
+      "title": "Workboard",
+      "key": "WB",
+      "path": "/Users/demo/agent-workboard",
+      "parent_id": null,
+      "machine": "laptop",
+      "herdr_workspaces": [
+        "workboard"
+      ],
+      "next_seq": 1
+    },
+    {
+      "id": "sample-app",
+      "title": "Sample app",
+      "key": "APP",
+      "path": "/Users/demo/sample-app",
+      "parent_id": null,
+      "machine": "laptop",
+      "herdr_workspaces": [
+        "sample-app"
+      ],
+      "next_seq": 1
+    }
+  ],
+  "cards": [],
+  "workspaces": []
+}

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Convert markdown/text/html to PDF using pandoc + Chrome headless."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+MAC_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def find_chrome() -> Path | None:
+    """WB_CHROME, the macOS app, or a Chrome/Chromium binary on PATH."""
+    for candidate in (os.environ.get("WB_CHROME"), MAC_CHROME):
+        if candidate and Path(candidate).exists():
+            return Path(candidate)
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
+
+
+PANDOC_FALLBACK = Path("/opt/homebrew/bin/pandoc")
+CSS = """
+<style>
+@page { size: A4; margin: 16mm; }
+html, body { margin: 0; padding: 0; background: #fff; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: #111827;
+  line-height: 1.45;
+  font-size: 11pt;
+}
+h1, h2, h3 { margin-top: 1.2em; margin-bottom: 0.5em; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #d1d5db; padding: 6px 8px; text-align: left; vertical-align: top; }
+pre, code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+pre {
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 10px;
+  overflow-x: auto;
+}
+blockquote {
+  margin: 1em 0;
+  padding-left: 1em;
+  border-left: 3px solid #d1d5db;
+  color: #374151;
+}
+</style>
+""".strip()
+
+
+def fail(message: str) -> int:
+    print(f"md2pdf: {message}", file=sys.stderr)
+    return 1
+
+
+def inject_css(html: str) -> str:
+    if "</head>" in html:
+        return html.replace("</head>", f"{CSS}\n</head>", 1)
+    return f"<head>{CSS}</head>\n{html}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Convert markdown/text/html to PDF")
+    parser.add_argument("input", help="input .md/.markdown/.txt/.html file")
+    parser.add_argument("output", help="output .pdf file")
+    args = parser.parse_args()
+
+    source = Path(args.input).expanduser()
+    target = Path(args.output).expanduser()
+    suffix = source.suffix.lower()
+    if suffix not in {".md", ".markdown", ".txt", ".html"}:
+        return fail("input must be .md, .markdown, .txt, or .html")
+    if not source.exists() or not source.is_file():
+        return fail(f"input file does not exist: {source}")
+    pandoc = shutil.which("pandoc")
+    if not pandoc and PANDOC_FALLBACK.exists():
+        pandoc = str(PANDOC_FALLBACK)
+    if not pandoc:
+        return fail("pandoc is required but was not found in PATH")
+    chrome = find_chrome()
+    if chrome is None:
+        return fail("Chrome or Chromium not found (set WB_CHROME to its path)")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="md2pdf-") as tmp:
+        tmp_path = Path(tmp)
+        base_html = tmp_path / "base.html"
+        styled_html = tmp_path / "styled.html"
+        if suffix == ".html":
+            pandoc_from = "html"
+        elif suffix == ".txt":
+            pandoc_from = "markdown+pipe_tables"
+        else:
+            pandoc_from = "gfm"
+
+        pandoc_result = subprocess.run(
+            [
+                pandoc,
+                "--from",
+                pandoc_from,
+                "--to",
+                "html5",
+                "--standalone",
+                "--output",
+                str(base_html),
+                str(source),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if pandoc_result.returncode != 0:
+            details = (pandoc_result.stderr or pandoc_result.stdout).strip() or "unknown pandoc error"
+            return fail(f"pandoc failed: {details}")
+
+        html = base_html.read_text(encoding="utf-8")
+        styled_html.write_text(inject_css(html), encoding="utf-8")
+
+        chrome_result = subprocess.run(
+            [
+                str(chrome),
+                "--headless=new",
+                "--disable-gpu",
+                "--no-pdf-header-footer",
+                f"--print-to-pdf={target}",
+                str(styled_html),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if chrome_result.returncode != 0:
+            details = (chrome_result.stderr or chrome_result.stdout).strip() or "unknown chrome error"
+            return fail(f"chrome failed: {details}")
+
+    if not target.exists() or target.stat().st_size == 0:
+        return fail(f"output was not written: {target}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
