@@ -1,0 +1,63 @@
+#!/bin/bash
+# lead-canary: tripwires for a long-running Claude Code lead session in herdr.
+#
+#   lead-canary --enable [label]   the user opts this herdr workspace in (label of its lead tab, default "lead")
+#   lead-canary --register         the current Claude session becomes this workspace's lead
+#   lead-canary --check [session]  print the measurements and OK | WARN | TRIP
+#   lead-canary                    as a Claude Code UserPromptSubmit hook: reads the hook JSON on stdin and
+#                                  prints a notice into the session only when a canary is warm or tripped
+#
+# Only registered lead sessions in enabled workspaces are checked; everything else exits silently.
+# Thresholds (env): LEAD_CTX_WARN=350 LEAD_CTX_TRIP=500 (thousand tokens), LEAD_STRIKES_WARN=2,
+# LEAD_STRIKES_TRIP=3, LEAD_COMPACT_TRIP=1. State lives in ${HERDR_LEADS_DIR:-~/.herdr-leads}/claude.
+H="${HERDR_LEADS_DIR:-$HOME/.herdr-leads}/claude"
+WS="${HERDR_WORKSPACE_ID:-}"
+mkdir -p "$H/strikes" "$H/docs"
+
+case "${1:-}" in
+  --enable)
+    [ -n "$WS" ] || { echo "not inside a herdr workspace"; exit 1; }
+    grep -qx "$WS" "$H/workspaces" 2>/dev/null || echo "$WS" >> "$H/workspaces"
+    awk -v w="$WS" '$1!=w' "$H/labels" 2>/dev/null > "$H/labels.tmp"; echo "$WS ${2:-lead}" >> "$H/labels.tmp"; mv "$H/labels.tmp" "$H/labels"
+    echo "lead handover enabled for workspace $WS (lead label: ${2:-lead})"; exit 0 ;;
+  --register)
+    grep -qx "${WS:-none}" "$H/workspaces" 2>/dev/null || { echo "workspace ${WS:-none} is not enabled; the user runs: lead-canary --enable"; exit 1; }
+    sid="${CLAUDE_CODE_SESSION_ID:?no Claude session id}"
+    grep -qx "$sid" "$H/lead-sessions" 2>/dev/null || echo "$sid" >> "$H/lead-sessions"
+    echo "$sid" > "$H/lead-of-$WS"
+    [ -f "$H/generation-$WS" ] || echo 1 > "$H/generation-$WS"
+    echo "registered $sid as lead of $WS (generation $(cat "$H/generation-$WS"))"; exit 0 ;;
+esac
+
+grep -qx "${WS:-none}" "$H/workspaces" 2>/dev/null || exit 0
+if [ "${1:-}" = "--check" ]; then sid="${2:-${CLAUDE_CODE_SESSION_ID:-}}"; tp=""; mode=check
+else in=$(cat 2>/dev/null); sid=$(printf '%s' "$in" | python3 -c "import sys,json;print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null); tp=$(printf '%s' "$in" | python3 -c "import sys,json;print(json.load(sys.stdin).get('transcript_path',''))" 2>/dev/null); mode=hook; fi
+[ -n "$sid" ] || exit 0
+grep -qx "$sid" "$H/lead-sessions" 2>/dev/null || { [ "$mode" = check ] && echo "session $sid is not a registered lead"; exit 0; }
+[ -f "$tp" ] || tp=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -1)
+[ -f "$tp" ] || exit 0
+compactions=$(grep -c '"subtype":"compact_boundary"' "$tp" 2>/dev/null); compactions=${compactions:-0}
+# live context size in thousands of tokens, from the newest usage record in the transcript
+ctx=$(tail -c 3000000 "$tp" | python3 -c "
+import sys,json
+k=0
+for line in sys.stdin.buffer.read().decode('utf-8','replace').split('\n'):
+    if '\"usage\"' not in line: continue
+    try: u=json.loads(line).get('message',{}).get('usage') or {}
+    except Exception: continue
+    t=(u.get('input_tokens') or 0)+(u.get('cache_read_input_tokens') or 0)+(u.get('cache_creation_input_tokens') or 0)
+    if t: k=t//1000
+print(k)" 2>/dev/null); ctx=${ctx:-0}
+strikes=$(grep -c . "$H/strikes/$sid.log" 2>/dev/null); strikes=${strikes:-0}
+state=OK; why=""
+[ "$ctx" -ge "${LEAD_CTX_WARN:-350}" ] && { state=WARN; why="context ${ctx}k tokens"; }
+[ "$strikes" -ge "${LEAD_STRIKES_WARN:-2}" ] && { state=WARN; why="$why; $strikes sloppiness strikes"; }
+[ "$ctx" -ge "${LEAD_CTX_TRIP:-500}" ] && { state=TRIP; why="context ${ctx}k tokens"; }
+[ "$compactions" -ge "${LEAD_COMPACT_TRIP:-1}" ] && { state=TRIP; why="$why; context was compacted $compactions time(s)"; }
+[ "$strikes" -ge "${LEAD_STRIKES_TRIP:-3}" ] && { state=TRIP; why="$why; $strikes sloppiness strikes"; }
+line="context=${ctx}k compactions=$compactions strikes=$strikes -> $state${why:+ (${why#; })}"
+if [ "$mode" = check ]; then echo "$line"; [ "$strikes" -gt 0 ] && sed 's/^/  strike: /' "$H/strikes/$sid.log"; exit 0; fi
+[ "$state" = OK ] && exit 0
+if [ "$state" = WARN ]; then echo "[handover canary] WARN: $line. Finish the current step carefully; write the handover document early. Skill: lead-handover."
+else echo "[handover canary] TRIPPED: $line. You are the lead session and your own tripwire has fired. Finish only the step in progress, then hand over to a fresh Claude session now, following the lead-handover skill. Tell the user in one line that you are doing so. Do not start new work in this session."; fi
+exit 0

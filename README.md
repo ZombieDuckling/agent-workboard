@@ -26,6 +26,7 @@ and when you reply the board wakes the agent that asked.
 - [Using it with your agents](#using-it-with-your-agents)
 - [Replies wake the agent](#replies-wake-the-agent)
 - [More than one machine](#more-than-one-machine)
+- [The herdr kit](#the-herdr-kit)
 - [Workspaces](#workspaces)
 - [Notifications](#notifications)
 - [Technical debt](#technical-debt)
@@ -52,8 +53,9 @@ The installer:
 1. writes `~/.config/workboard/config.env` (your owner id and name, from your user account),
 2. links `workboard`, `dashvis` and `md2pdf` into `~/.local/bin`,
 3. creates `board.json` (empty, or a fictional demo team with `--demo`),
-4. installs the agent skill and the `/dashvis` command for every agent it finds
-   (`~/.claude`, `~/.cursor`, `~/.codex`, `~/.config/opencode`),
+4. installs the agent skills (the workboard skill and the [herdr kit](#the-herdr-kit)) and the
+   `/dashvis` command for every agent it finds (`~/.claude`, `~/.cursor`, `~/.codex`,
+   `~/.config/opencode`), and links the herdr kit commands,
 5. on macOS, starts two launchd jobs: the web server (always on) and `sync` every 10 minutes.
 
 To start over with real data: `workboard init --force`. To remove everything it installed:
@@ -105,7 +107,7 @@ flowchart LR
 ## Using it with your agents
 
 After `install.sh`, every supported agent has the **workboard skill**
-(`skill/workboard/SKILL.md`). It tells the agent when to create and move cards, how to
+(`skills/workboard/SKILL.md`). It tells the agent when to create and move cards, how to
 comment, how to ask you things, and which id to use. You do not have to explain the board in
 your prompts; start real work and the agent puts a card on the board.
 
@@ -175,11 +177,53 @@ The board lives on one machine (the **board host**). Other machines run the same
 Both machines need key-based SSH to each other (`BatchMode` is used, so no password prompts).
 `workboard machines` lists them. `dashvis` on a remote machine opens an SSH tunnel to the board.
 
-Using [herdr](https://herdr.dev) on several machines? `herdr machine add` on
-each lets one herdr sidebar show the workspaces of every machine, while each agent keeps running
-where it lives.
+Using [herdr](https://herdr.dev) on several machines? `herdr-link buildbox --back laptop` (from
+the [herdr kit](#the-herdr-kit), a wrapper around `herdr machine add`) lets one herdr sidebar on
+each machine show the workspaces of both, while each agent keeps running where it lives.
 
 ![Machines page: live agents, dev servers and recent git activity per machine](docs/images/machines.png)
+
+## The herdr kit
+
+<img src="docs/images/herdr-kit.jpg" alt="A lead terminal fans work out to three worker terminals, and each worker reports to a card on the board" width="100%">
+
+The board is half of a working setup. The other half is how agents are started and watched:
+one **lead** session per [herdr](https://herdr.dev) workspace plans the work, starts cheap
+workers in their own herdr tabs, tracks each task as a card, and checks the results. The board
+knows each worker's pane, so your reply on a card reaches it. `install.sh` installs this kit
+too (leave it out with `--no-herdr`).
+
+| Skill | For | What it does |
+|-------|-----|--------------|
+| `herdr-orchestration` | Any lead | Choose the worker (OpenCode, Codex, Claude, or do it yourself), start it in a herdr tab, write the brief (with `brief-template.md` for literal local models), put it on a card, wait without polling, verify, tidy up. |
+| `opencode-lead` | OpenCode | Lets an OpenCode agent on a local or cheap model stand in as lead when Claude is out of quota: a notes file as memory, a step-by-step working method, worker recipes, checks before anything leaves the machine. |
+| `herdr-lead-mods` | Claude Code | Reads the optional `usage-meter` and `agent-radar` plugin lines from the lead's own pane, picks the worker tier from plan usage, and hands over to an OpenCode lead before the weekly limit. |
+| `lead-handover` | Claude Code | Tripwires for long-running leads (context size, compaction, self-recorded "strikes"). When one trips, the lead writes a handover document, starts its successor in a new tab and closes itself. |
+
+Commands it links into `~/.local/bin`:
+
+| Command | What it does |
+|---------|--------------|
+| `oc-run DIR TITLE BRIEF.md` | Run an OpenCode worker headlessly; writes `BRIEF.out.txt` and `.jsonl`. |
+| `start-opencode-lead WS DIR [HANDOVER.md]` | Open an `oc-lead` tab in herdr workspace `WS` and start OpenCode as its lead. |
+| `herdr-link PEER [--label L] [--back ALIAS]` | Link herdr on two machines (`herdr machine add`, both ways with `--back`), so one sidebar shows every workspace. |
+| `lead-canary`, `lead-strike`, `lead-handover`, `lead-retire` | The tripwire and handover scripts behind the `lead-handover` skill. |
+
+A typical day: open a herdr workspace for a project, start Claude Code in it and say "you are
+the lead for this project, use herdr-orchestration". It creates cards, briefs workers, and you
+steer from the board.
+
+To use lead handover in a workspace, install the hook once and opt the workspace in:
+
+```bash
+./install.sh --handover-hook   # adds lead-canary as a Claude Code UserPromptSubmit hook
+lead-canary --enable lead      # run inside the herdr workspace; "lead" is the lead tab's label
+```
+
+Then tell the lead to load `lead-handover` and register (`lead-canary --register`). Thresholds
+can be changed with `LEAD_CTX_WARN`, `LEAD_CTX_TRIP`, `LEAD_STRIKES_WARN`, `LEAD_STRIKES_TRIP`
+and `LEAD_COMPACT_TRIP`. State, handover documents and OpenCode lead notes live in
+`~/.herdr-leads` (`HERDR_LEADS_DIR` to move it).
 
 ## Workspaces
 
@@ -307,7 +351,10 @@ systemctl --user enable --now workboard
   not expose it to a network. Reach it from other machines through `dashvis` (an SSH tunnel).
 - Agents are told never to put secrets in tickets. Treat `board.json` and `attachments/` as
   private: they are in `.gitignore`.
-- Wakes run agent CLIs in skip-permissions mode unless `WB_YOLO=0` (see above).
+- Wakes run agent CLIs in skip-permissions mode unless `WB_YOLO=0` (see above). So does the
+  successor started by `lead-handover`.
+- `install.sh --handover-hook` edits `~/.claude/settings.json` (a backup is kept next to it);
+  `--uninstall` removes the hook again.
 
 ## Development
 
@@ -321,5 +368,5 @@ stdlib-only (`collect.py` and `debt.py` are piped to remote machines over SSH).
 
 ## License
 
-[MIT](LICENSE). The two illustrations in `docs/images` (`hero.png`, `wake.jpg`) are AI-generated;
+[MIT](LICENSE). The illustrations in `docs/images` (`hero.png`, `wake.jpg`, `herdr-kit.jpg`) are AI-generated;
 the screenshots are of the real app running `workboard init --demo`.

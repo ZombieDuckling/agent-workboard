@@ -1,0 +1,13 @@
+#!/bin/bash
+# lead-retire [seconds]: the LAST command a retiring lead runs, after the successor's ack exists and just
+# before its final message. It unregisters this session and closes its own herdr tab after a delay
+# (default 90 s), so the final message is delivered first.
+H="${HERDR_LEADS_DIR:-$HOME/.herdr-leads}/claude"
+grep -qx "${HERDR_WORKSPACE_ID:-none}" "$H/workspaces" 2>/dev/null || { echo "the lead handover protocol is not enabled in this herdr workspace"; exit 1; }
+delay="${1:-90}"; tab="${HERDR_TAB_ID:?no herdr tab id}"
+succ=$(cat "$H/lead-of-$HERDR_WORKSPACE_ID" 2>/dev/null)
+[ -n "$succ" ] && [ "$succ" != "${CLAUDE_CODE_SESSION_ID:-}" ] || { echo "no successor is registered yet; do not retire"; exit 1; }
+grep -vx "${CLAUDE_CODE_SESSION_ID:-none}" "$H/lead-sessions" > "$H/l.tmp"; mv "$H/l.tmp" "$H/lead-sessions"
+echo "$(date '+%Y-%m-%d %H:%M') $HERDR_WORKSPACE_ID retired ${CLAUDE_CODE_SESSION_ID:-?} tab=$tab closes in ${delay}s" >> "$H/log.md"
+nohup sh -c "sleep $delay; herdr tab close '$tab'" >/dev/null 2>&1 &
+echo "this tab ($tab) closes in ${delay}s; send the final message now and do nothing else"

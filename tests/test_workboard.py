@@ -1477,5 +1477,111 @@ class SetupTests(unittest.TestCase):
         self.assertIn("Done, see auth.ts", text)
 
 
+HERDR_BIN = REPO_ROOT / "herdr" / "bin"
+
+
+class HerdrKitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmpdir.name)
+        self.sid = "sess-1"
+        self.transcript = self.home / ".claude" / "projects" / "demo" / f"{self.sid}.jsonl"
+        self.transcript.parent.mkdir(parents=True)
+        self.write_transcript(120_000)
+        self.env = {"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HERDR_WORKSPACE_ID": "w2", "CLAUDE_CODE_SESSION_ID": self.sid}
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def write_transcript(self, tokens: int, compacted: bool = False) -> None:
+        lines = [json.dumps({"message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": tokens}}})]
+        if compacted:
+            lines.append(json.dumps({"type": "system", "subtype": "compact_boundary"}).replace(" ", ""))
+        self.transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def run_bin(self, name: str, *args: str, stdin: str = "", **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["/bin/bash", str(HERDR_BIN / name), *args], input=stdin, text=True,
+                              capture_output=True, env={**self.env, **env}, timeout=30)
+
+    def test_scripts_parse(self) -> None:
+        for script in sorted(HERDR_BIN.iterdir()):
+            res = subprocess.run(["/bin/bash", "-n", str(script)], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"{script.name}: {res.stderr}")
+
+    def test_canary_is_silent_until_the_workspace_is_enabled_and_registered(self) -> None:
+        hook_input = json.dumps({"session_id": self.sid, "transcript_path": str(self.transcript)})
+        self.write_transcript(600_000)
+        self.assertEqual(self.run_bin("lead-canary", stdin=hook_input).stdout, "")
+        self.assertNotEqual(self.run_bin("lead-canary", "--register").returncode, 0)
+        self.assertIn("enabled for workspace w2", self.run_bin("lead-canary", "--enable", "boss").stdout)
+        self.assertEqual(self.run_bin("lead-canary", stdin=hook_input).stdout, "")
+        self.assertEqual(self.run_bin("lead-canary", "--register").returncode, 0)
+        self.assertIn("[handover canary] TRIPPED", self.run_bin("lead-canary", stdin=hook_input).stdout)
+        self.assertEqual(self.run_bin("lead-canary", stdin=hook_input, HERDR_WORKSPACE_ID="w9").stdout, "")
+        labels = (self.home / ".herdr-leads" / "claude" / "labels").read_text()
+        self.assertEqual(labels.strip(), "w2 boss")
+
+    def test_canary_thresholds_strikes_and_compaction(self) -> None:
+        self.run_bin("lead-canary", "--enable")
+        self.run_bin("lead-canary", "--register")
+        self.assertIn("-> OK", self.run_bin("lead-canary", "--check").stdout)
+        self.write_transcript(400_000)
+        self.assertIn("-> WARN (context 400k tokens)", self.run_bin("lead-canary", "--check").stdout)
+        self.assertIn("-> OK", self.run_bin("lead-canary", "--check", LEAD_CTX_WARN="450").stdout)
+        self.write_transcript(120_000)
+        self.run_bin("lead-strike", "repeated a zsh word-splitting mistake")
+        self.assertIn("-> WARN", self.run_bin("lead-strike", "claimed a fix without checking").stdout)
+        out = self.run_bin("lead-strike", "lost track of a worker").stdout
+        self.assertIn("-> TRIP", out)
+        self.assertIn("strike: ", out)
+        self.write_transcript(120_000, compacted=True)
+        self.run_bin("lead-canary", "--register", CLAUDE_CODE_SESSION_ID="sess-2")
+        self.transcript.rename(self.transcript.with_name("sess-2.jsonl"))
+        self.assertIn("compacted 1 time", self.run_bin("lead-canary", "--check", "sess-2").stdout)
+
+    def test_retire_and_handover_refuse_without_a_successor_or_herdr(self) -> None:
+        self.assertIn("not enabled", self.run_bin("lead-handover", "doc.md").stdout)
+        self.run_bin("lead-canary", "--enable")
+        self.run_bin("lead-canary", "--register")
+        res = self.run_bin("lead-retire", HERDR_TAB_ID="w2:t1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("no successor", res.stdout)
+        doc = self.home / "doc.md"
+        doc.write_text("# handover\n", encoding="utf-8")
+        self.assertIn("not inside herdr", self.run_bin("lead-handover", str(doc)).stdout)
+
+    def test_skills_have_frontmatter_and_stay_generic(self) -> None:
+        skills = sorted((REPO_ROOT / "skills").glob("*/SKILL.md"))
+        self.assertEqual([p.parent.name for p in skills],
+                         ["herdr-lead-mods", "herdr-orchestration", "lead-handover", "opencode-lead", "workboard"])
+        for path in skills:
+            text = path.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("---\nname: " + path.parent.name + "\n"), path)
+            self.assertIn("\ndescription:", text.split("\n---\n", 1)[0])
+        kit = [REPO_ROOT / "skills", HERDR_BIN]
+        files = [f for d in kit for f in d.rglob("*") if f.is_file()]
+        for f in files:
+            text = f.read_text(encoding="utf-8")
+            for word in ("/Users/", "~/Projects/", "deepseek", "~/.claude/handover"):
+                self.assertNotIn(word, text, f"{f.relative_to(REPO_ROOT)} mentions {word}")
+
+    def test_installer_without_herdr_kit(self) -> None:
+        repo = self.home / "repo"
+        shutil.copytree(REPO_ROOT, repo, ignore=shutil.ignore_patterns(".git", "board.json", "snapshots.json", "BOARD.md", "debt.json"))
+        (self.home / ".cursor").mkdir()
+        env = {"HOME": str(self.home), "USER": "tester", "PATH": "/usr/bin:/bin"}
+        res = subprocess.run(["/bin/bash", str(repo / "install.sh"), "--no-launchd", "--no-herdr"],
+                             capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(sorted(p.name for p in (self.home / ".cursor" / "skills").iterdir()), ["workboard"])
+        self.assertFalse((self.home / ".local" / "bin" / "lead-canary").exists())
+        res = subprocess.run(["/bin/bash", str(repo / "install.sh"), "--no-launchd", "--force"],
+                             capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(sorted(p.name for p in (self.home / ".cursor" / "skills").iterdir()),
+                         ["herdr-orchestration", "opencode-lead", "workboard"])
+        self.assertTrue((self.home / ".local" / "bin" / "lead-canary").is_symlink())
+
+
 if __name__ == "__main__":
     unittest.main()

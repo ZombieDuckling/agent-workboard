@@ -1,0 +1,8 @@
+#!/bin/bash
+# lead-strike "<what went wrong>": the lead records its own sloppiness. Enough strikes trips the canary.
+H="${HERDR_LEADS_DIR:-$HOME/.herdr-leads}/claude"
+grep -qx "${HERDR_WORKSPACE_ID:-none}" "$H/workspaces" 2>/dev/null || { echo "the lead handover protocol is not enabled in herdr workspace ${HERDR_WORKSPACE_ID:-none} (the user runs: lead-canary --enable)"; exit 1; }
+sid="${CLAUDE_CODE_SESSION_ID:?no session id}"; [ -n "$*" ] || { echo "usage: lead-strike \"<what went wrong>\""; exit 2; }
+mkdir -p "$H/strikes"
+echo "$(date '+%Y-%m-%d %H:%M') $*" >> "$H/strikes/$sid.log"
+"$(dirname "$0")/lead-canary" --check "$sid"

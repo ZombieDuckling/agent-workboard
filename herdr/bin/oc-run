@@ -1,0 +1,39 @@
+#!/bin/bash
+# oc-run <workdir> <session-title> <brief-file> [session-id]
+# Runs an OpenCode agent headlessly in <workdir> with the brief, auto-approving permissions,
+# writing JSON events to <brief-file>.out.jsonl and the final text to <brief-file>.out.txt.
+# Model: OC_MODEL, else the "model" in ~/.config/opencode/opencode.json, else OpenCode's default.
+# Extra flags for `opencode run`: OC_EXTRA.
+set -u
+[ $# -ge 3 ] || { sed -n '2,6p' "$0"; exit 2; }
+dir="$1"; title="$2"; brief="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"; sid="${4:-}"
+out="${brief%.md}.out"
+cd "$dir" || exit 2
+cfg_model=$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.config/opencode/opencode.json"))).get("model",""))' 2>/dev/null)
+model="${OC_MODEL:-$cfg_model}"
+args=(run --auto --format json --title "$title")
+[ -n "$model" ] && args+=(-m "$model")
+[ -n "$sid" ] && args+=(--session "$sid"); [ -n "${OC_EXTRA:-}" ] && args+=($OC_EXTRA)
+opencode "${args[@]}" "$(cat "$brief")" > "$out.jsonl" 2> "$out.err"
+rc=$?
+python3 - "$out.jsonl" "$out.txt" <<'PY'
+import sys, json
+src, dst = sys.argv[1], sys.argv[2]
+texts = []; sid = ''
+for line in open(src, encoding='utf-8', errors='replace'):
+    line=line.strip()
+    if not line: continue
+    try: ev = json.loads(line)
+    except Exception: continue
+    sid = ev.get('sessionID') or ev.get('session_id') or ev.get('sessionId') or sid
+    t = ev.get('type') or ev.get('kind') or ''
+    part = ev.get('part') or ev
+    if isinstance(part, dict) and part.get('type') == 'text' and part.get('text'):
+        texts.append(part['text'])
+    elif t == 'text' and ev.get('text'):
+        texts.append(ev['text'])
+open(dst,'w').write(('session: %s\n\n' % sid) + '\n'.join(texts[-6:]))
+print('session:', sid); print('final text (tail):'); print('\n'.join(texts[-3:])[-1500:])
+PY
+echo "exit=$rc"
+exit $rc

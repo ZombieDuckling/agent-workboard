@@ -6,9 +6,13 @@
 #   ./install.sh --demo                  same, with a fictional demo board to explore
 #   ./install.sh --remote HOST --board-dir PATH [--machine ID]
 #                                        another machine: `workboard` forwards over SSH to HOST
-#   ./install.sh --uninstall             remove links, launchd jobs and the skill/commands it installed
+#   ./install.sh --uninstall             remove links, launchd jobs, the hook and the skills/commands it installed
 #
-# Options: --owner ID (default: $USER)  --owner-name NAME  --no-launchd  --no-agents  --force
+# The herdr kit (orchestration, lead and handover skills, oc-run, start-opencode-lead, herdr-link,
+# lead-* tripwire commands) is installed too; leave it out with --no-herdr.
+#
+# Options: --owner ID (default: $USER)  --owner-name NAME  --no-launchd  --no-agents  --no-herdr
+#          --handover-hook (add the lead-canary UserPromptSubmit hook to ~/.claude/settings.json)  --force
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +22,7 @@ CONFIG="$CONFIG_DIR/config.env"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 JOBS=(dev.workboard.web dev.workboard.sync)
 
-demo=0 remote_host="" board_dir="" machine="" owner="" owner_name="" launchd=1 agents=1 force=0 uninstall=0
+demo=0 remote_host="" board_dir="" machine="" owner="" owner_name="" launchd=1 agents=1 herdr=1 hook=0 force=0 uninstall=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --demo) demo=1 ;;
@@ -29,9 +33,11 @@ while [[ $# -gt 0 ]]; do
     --owner-name) owner_name="${2:?--owner-name needs a name}"; shift ;;
     --no-launchd) launchd=0 ;;
     --no-agents) agents=0 ;;
+    --no-herdr) herdr=0 ;;
+    --handover-hook) hook=1 ;;
     --force) force=1 ;;
     --uninstall) uninstall=1 ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -58,6 +64,47 @@ place() {  # place SRC DEST: copy, keeping a backup of a different existing file
   cp "$src" "$dest"
 }
 
+place_tree() {  # place_tree SRC_DIR DEST_DIR: place every file of a skill folder
+  local src="$1" dest="$2" f
+  while IFS= read -r f; do place "$src/$f" "$dest/$f"; done < <(cd "$src" && find . -type f | sed 's#^\./##')
+}
+
+same_tree() { [[ -d "$2" ]] && diff -rq "$1" "$2" >/dev/null 2>&1; }
+
+# Skills. Most go to every agent home; herdr-lead-mods and lead-handover only to Claude Code, because
+# they read Claude's pane mods and session transcripts.
+SKILLS=(workboard herdr-orchestration opencode-lead herdr-lead-mods lead-handover)
+skill_scope() { case "$1" in herdr-lead-mods|lead-handover) echo claude ;; *) echo all ;; esac; }
+is_herdr_skill() { [[ "$1" != workboard ]]; }
+HERDR_BINS=(oc-run start-opencode-lead herdr-link lead-canary lead-strike lead-handover lead-retire)
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+
+hook_edit() {  # hook_edit add|remove COMMAND: prints added, removed or unchanged
+  python3 - "$CLAUDE_SETTINGS" "$1" "$2" <<'PYHOOK'
+import json, os, sys, shutil, time
+path, action, cmd = sys.argv[1:4]
+data = json.load(open(path)) if os.path.exists(path) else {}
+hooks = data.setdefault("hooks", {})
+groups = hooks.setdefault("UserPromptSubmit", [])
+present = any(h.get("command") == cmd for g in groups for h in g.get("hooks", []))
+if action == "add" and not present:
+    groups.append({"hooks": [{"type": "command", "command": cmd}]})
+elif action == "remove" and present:
+    for g in groups:
+        g["hooks"] = [h for h in g.get("hooks", []) if h.get("command") != cmd]
+    hooks["UserPromptSubmit"] = [g for g in groups if g.get("hooks")]
+    if not hooks["UserPromptSubmit"]:
+        del hooks["UserPromptSubmit"]
+else:
+    print("unchanged"); sys.exit(0)
+if os.path.exists(path):
+    shutil.copy(path, path + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+os.makedirs(os.path.dirname(path), exist_ok=True)
+json.dump(data, open(path, "w"), indent=2)
+print("added" if action == "add" else "removed")
+PYHOOK
+}
+
 if [[ "$uninstall" -eq 1 ]]; then
   echo "Uninstalling Workboard"
   for job in "${JOBS[@]}"; do
@@ -66,15 +113,20 @@ if [[ "$uninstall" -eq 1 ]]; then
       rm -f "$LAUNCH_DIR/$job.plist"; say "removed launchd job $job"
     fi
   done
-  for name in workboard dashvis md2pdf; do
+  for name in workboard dashvis md2pdf "${HERDR_BINS[@]}"; do
     if [[ -L "$BIN/$name" && "$(readlink "$BIN/$name")" == "$REPO"/* ]]; then rm -f "$BIN/$name"; say "removed $BIN/$name"; fi
   done
   while IFS='|' read -r skills commands; do
     [[ -z "$skills" ]] && continue
-    cmp -s "$REPO/skill/workboard/SKILL.md" "$skills/workboard/SKILL.md" 2>/dev/null && rm -rf "$skills/workboard" && say "removed $skills/workboard"
-    cmp -s "$REPO/commands/dashvis.md" "$commands/dashvis.md" 2>/dev/null && rm -f "$commands/dashvis.md" && say "removed $commands/dashvis.md"
+    for sk in "${SKILLS[@]}"; do
+      if same_tree "$REPO/skills/$sk" "$skills/$sk"; then rm -rf "$skills/$sk"; say "removed $skills/$sk"; fi
+    done
+    if cmp -s "$REPO/commands/dashvis.md" "$commands/dashvis.md" 2>/dev/null; then rm -f "$commands/dashvis.md"; say "removed $commands/dashvis.md"; fi
   done < <(agent_targets)
-  say "kept $CONFIG and your board data"
+  if [[ -f "$CLAUDE_SETTINGS" ]] && grep -q "$BIN/lead-canary" "$CLAUDE_SETTINGS"; then
+    [[ "$(hook_edit remove "$BIN/lead-canary")" == removed ]] && say "removed the lead-canary hook from $CLAUDE_SETTINGS"
+  fi
+  say "kept $CONFIG, your board data and ~/.herdr-leads"
   exit 0
 fi
 
@@ -123,6 +175,12 @@ if [[ "$mode" == host ]]; then ln -sf "$REPO/scripts/workboard.py" "$BIN/workboa
 ln -sf "$REPO/scripts/dashvis" "$BIN/dashvis"
 ln -sf "$REPO/scripts/md2pdf" "$BIN/md2pdf"
 say "linked workboard, dashvis and md2pdf into $BIN"
+if [[ "$herdr" -eq 1 ]]; then
+  chmod +x "$REPO"/herdr/bin/*
+  for name in "${HERDR_BINS[@]}"; do ln -sf "$REPO/herdr/bin/$name" "$BIN/$name"; done
+  mkdir -p "$HOME/.herdr-leads"
+  say "linked the herdr kit (${HERDR_BINS[*]}) into $BIN"
+fi
 case ":$PATH:" in *":$BIN:"*) ;; *) say "NOTE: add $BIN to your PATH (e.g. in ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\")" ;; esac
 
 # 3. Board
@@ -141,17 +199,36 @@ else
   fi
 fi
 
-# 4. Agent skill and /dashvis
+# 4. Agent skills and /dashvis
 if [[ "$agents" -eq 1 ]]; then
   found=0
   while IFS='|' read -r skills commands; do
     [[ -z "$skills" ]] && continue
-    place "$REPO/skill/workboard/SKILL.md" "$skills/workboard/SKILL.md"
+    installed=()
+    for sk in "${SKILLS[@]}"; do
+      if is_herdr_skill "$sk" && [[ "$herdr" -eq 0 ]]; then continue; fi
+      if [[ "$(skill_scope "$sk")" == claude && "$skills" != "$HOME/.claude/skills" ]]; then continue; fi
+      place_tree "$REPO/skills/$sk" "$skills/$sk"
+      installed+=("$sk")
+    done
     place "$REPO/commands/dashvis.md" "$commands/dashvis.md"
-    say "installed skill and /dashvis for ${skills%/skills}"
+    say "installed /dashvis and skills (${installed[*]}) for ${skills%/skills}"
     found=1
   done < <(agent_targets)
-  [[ "$found" -eq 1 ]] || say "no agent folders found (~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode); copy skill/ and commands/ by hand"
+  [[ "$found" -eq 1 ]] || say "no agent folders found (~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode); copy skills/ and commands/ by hand"
+fi
+
+# 4b. Lead handover hook (opt-in, Claude Code)
+if [[ "$hook" -eq 1 ]]; then
+  if [[ "$herdr" -eq 0 ]]; then
+    say "skipped --handover-hook: it needs the herdr kit (drop --no-herdr)"
+  else
+    case "$(hook_edit add "$BIN/lead-canary")" in
+      added) say "added the lead-canary UserPromptSubmit hook to $CLAUDE_SETTINGS (backup kept)" ;;
+      *) say "lead-canary hook already in $CLAUDE_SETTINGS" ;;
+    esac
+    say "enable a workspace from inside herdr with: lead-canary --enable [label]"
+  fi
 fi
 
 # 5. Background jobs (macOS board host)

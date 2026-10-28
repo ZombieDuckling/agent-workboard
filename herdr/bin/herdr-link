@@ -1,0 +1,42 @@
+#!/bin/bash
+# herdr-link: link the herdr apps on two machines so each sidebar lists every workspace, labelled by
+# machine. Agents keep running on the machine they started on; typing into a remote pane goes over SSH.
+#
+#   herdr-link PEER [--label "Build box"] [--back ALIAS [--back-label "Laptop"]]
+#       PEER   ssh alias of the other machine (from this one)
+#       --back also set up the other side: ALIAS is how the other machine reaches this one over ssh
+#   herdr-link --status    show the saved machines on this machine
+#
+# Safe to re-run. Never stops or replaces a herdr server: `herdr machine add` asks first and defaults
+# to No when there is no terminal. Needs passwordless SSH (keys) in each direction you link.
+set -euo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+command -v herdr >/dev/null || { echo "herdr-link: herdr is not installed on $(hostname -s)" >&2; exit 1; }
+if [[ "${1:-}" == "--status" ]]; then herdr machine list; exit 0; fi
+if [[ -z "${1:-}" || "${1:-}" == -* ]]; then sed -n '2,12p' "$0"; exit 2; fi
+
+peer="$1"; shift
+label="$peer" back="" back_label="$(hostname -s)"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --label) label="${2:?}"; shift ;;
+    --back) back="${2:?}"; shift ;;
+    --back-label) back_label="${2:?}"; shift ;;
+    *) echo "herdr-link: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if herdr machine list --json | python3 -c 'import json,sys; t=sys.argv[1]; sys.exit(0 if any(m.get("target")==t for m in json.load(sys.stdin)) else 1)' "$peer"; then
+  echo "$(hostname -s): $label ($peer) already saved"
+else
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$peer" true \
+    || { echo "herdr-link: cannot ssh to $peer without a password; set up SSH keys first" >&2; exit 1; }
+  herdr machine add "$peer" --label "$label" </dev/null
+fi
+
+if [[ -n "$back" ]]; then
+  echo "setting up the other side ($peer -> $back)"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$peer" "bash -s -- $(printf '%q' "$back") --label $(printf '%q' "$back_label")" < "$0"
+fi

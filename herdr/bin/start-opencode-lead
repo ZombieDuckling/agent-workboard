@@ -1,0 +1,21 @@
+#!/bin/bash
+# Start an OpenCode lead in a herdr workspace, in a new visible tab.
+# Usage: start-opencode-lead <workspace-id> <project-dir> [handover-file]
+# Example: start-opencode-lead w2 ~/code/my-app ~/.herdr-leads/w2-handover.md
+# Model: OpenCode's configured default, or OC_MODEL=<provider/model>.
+set -euo pipefail
+WS=${1:?workspace id, e.g. w2}; DIR=${2:?project folder}; HO=${3:-}
+DIR=$(cd "$DIR" && pwd)
+LEADS="${HERDR_LEADS_DIR:-$HOME/.herdr-leads}"
+mkdir -p "$LEADS"
+[ -z "$HO" ] && HO=$(ls -t "$LEADS/$WS"-*.md 2>/dev/null | grep -v opencode-notes | head -1 || true)
+PROMPT="You are the LEAD of herdr workspace $WS. Claude is not available, so you replace the Claude lead. First use the skill tool to load the skill opencode-lead and read it fully, then follow its section 1 step by step. Project folder: $DIR."
+[ -n "$HO" ] && PROMPT="$PROMPT Handover file from the previous lead: $HO - read it fully; it is your task list."
+P=$(herdr tab create --workspace "$WS" --cwd "$DIR" --label "oc-lead" | grep -oE '"pane_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$P" ] || { echo "could not create a tab in $WS" >&2; exit 1; }
+START="$LEADS/$WS-opencode-start.txt"
+printf '%s' "$PROMPT" > "$START"
+model=""; [ -n "${OC_MODEL:-}" ] && model=" -m \"$OC_MODEL\""
+herdr pane send-text "$P" "cd \"$DIR\" && opencode --auto$model --prompt \"\$(cat \"$START\")\"
+"
+echo "OpenCode lead starting in $WS, pane $P${HO:+, handover $HO}"

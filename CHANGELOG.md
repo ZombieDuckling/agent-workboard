@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.0
+
+The herdr kit: the skills and commands that run agents around the board.
+
+- Skills: `herdr-orchestration` (lead starts, briefs, tracks and verifies workers in herdr tabs,
+  with an OpenCode brief template), `opencode-lead` (OpenCode stands in as lead on a local or
+  cheap model), `herdr-lead-mods` (worker tier from Claude plan usage) and `lead-handover`
+  (tripwires that make a long-running lead hand over to a fresh session).
+- Commands: `oc-run`, `start-opencode-lead`, `herdr-link`, `lead-canary`, `lead-strike`,
+  `lead-handover`, `lead-retire`.
+- `install.sh` installs the kit (`--no-herdr` to skip it) and can add the lead-canary hook to
+  Claude Code (`--handover-hook`); `--uninstall` removes both.
+- The workboard skill moved from `skill/` to `skills/`.
+
 ## 1.0.0
 
 First public release.

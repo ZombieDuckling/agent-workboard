@@ -1,0 +1,44 @@
+#!/bin/bash
+# lead-handover <handover-doc.md>: start the successor lead session in a new herdr tab and brief it.
+# Prints the successor's tab id. The successor registers itself as lead, takes the workspace's lead label,
+# focuses its tab, and retires this one (see the lead-handover skill).
+# The successor starts with --dangerously-skip-permissions unless WB_YOLO=0; extra Claude flags: LEAD_CLAUDE_ARGS.
+H="${HERDR_LEADS_DIR:-$HOME/.herdr-leads}/claude"
+grep -qx "${HERDR_WORKSPACE_ID:-none}" "$H/workspaces" 2>/dev/null || { echo "the lead handover protocol is not enabled in herdr workspace ${HERDR_WORKSPACE_ID:-none} (the user runs: lead-canary --enable)"; exit 1; }
+set -u
+DOC="${1:?handover document path}"; [ -s "$DOC" ] || { echo "handover document missing or empty: $DOC"; exit 1; }
+DOC="$(cd "$(dirname "$DOC")" && pwd)/$(basename "$DOC")"
+[ "${HERDR_ENV:-}" = 1 ] || { echo "not inside herdr"; exit 1; }
+WS="$HERDR_WORKSPACE_ID"; L=$(awk -v w="$WS" '$1==w{print $2}' "$H/labels" 2>/dev/null); L=${L:-lead}
+G="$H/generation-$WS"; DP="$WS-"
+gen=$(( $(cat "$G" 2>/dev/null || echo 1) + 1 )); name="$L-g$gen"
+claude_args=(); [ "${WB_YOLO:-1}" = 0 ] || claude_args+=(--dangerously-skip-permissions)
+[ -n "${LEAD_CLAUDE_ARGS:-}" ] && claude_args+=(${LEAD_CLAUDE_ARGS})
+out=$(herdr tab create --workspace "$WS" --cwd "$HOME" --label "$name" --no-focus)
+P=$(echo "$out" | grep -oE '"pane_id":"[^"]*"' | head -1 | cut -d'"' -f4); T=$(echo "$out" | grep -oE '"tab_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$P" ] || { echo "could not create a tab: $out"; exit 1; }
+old_tab=$(herdr agent list | python3 -c "import sys,json,os;print(next((a['tab_id'] for a in json.load(sys.stdin)['result']['agents'] if a.get('pane_id')==os.environ.get('HERDR_PANE_ID')),''))" 2>/dev/null)
+herdr agent start "$name" --kind claude --pane "$P" --timeout 60000 ${claude_args[@]+-- "${claude_args[@]}"} >/dev/null 2>&1
+# Claude may stop on the folder-trust prompt. The agent is not registered until it is answered, so drive the pane.
+for i in 1 2 3 4 5 6; do sleep 4
+  if herdr pane read "$P" 2>/dev/null | grep -q 'Yes, I trust this folder'; then herdr pane send-keys "$P" down enter >/dev/null 2>&1; sleep 6; fi
+  herdr agent get "$name" 2>/dev/null | grep -q '"agent_status":"idle"' && break
+done
+herdr agent get "$name" 2>/dev/null | grep -q '"agent_status"' || { echo "successor did not start; read the pane: herdr pane read $P"; exit 1; }
+mkdir -p "$H/docs"
+BRIEF="$H/docs/${DP}brief-g$gen.md"; ACK="$H/docs/${DP}ack-g$gen.txt"
+cat > "$BRIEF" <<BRIEF
+You are generation $gen of the lead ("$L") session in herdr workspace $WS. The previous lead (session ${CLAUDE_CODE_SESSION_ID:-unknown}, herdr tab ${old_tab:-unknown}) tripped its handover canary and is handing its whole job to you. You replace it.
+
+Do these in order before anything else:
+1. Run:  lead-canary --register && echo $gen > $G
+2. Read the lead-handover skill completely. Its canaries and its handover procedure now bind you, and every lead after you.
+3. Read the herdr-orchestration skill, then the handover document: $DOC . Read it completely. Verify its claims about running jobs and repo state with commands before relying on them.
+4. Run:  herdr tab rename ${old_tab:-OLD_TAB} retired-g$((gen-1)) ; herdr tab rename $T $L ; herdr tab focus $T
+5. Write one line to $ACK saying what you understand the open work to be.
+6. Tell the user in two or three sentences that you have taken over, what is in flight, and what you will do next. Then continue the work in the handover document.
+7. The retired lead closes its own tab (${old_tab:-OLD_TAB}) about 90 seconds after it retires. Two minutes after your acknowledgement, run herdr tab list; if that tab is still open, close it yourself: herdr tab close ${old_tab:-OLD_TAB} . A retired lead never stays open.
+BRIEF
+herdr agent prompt "$name" "$(cat "$BRIEF")" >/dev/null 2>&1 || { echo "could not prompt the successor; tab $T is open, brief at $BRIEF"; exit 1; }
+echo "$(date '+%Y-%m-%d %H:%M') $WS g$((gen-1)) (${CLAUDE_CODE_SESSION_ID:-?}) -> g$gen tab=$T doc=$DOC reason=$("$(dirname "$0")/lead-canary" --check 2>/dev/null | head -1)" >> "$H/log.md"
+echo "successor $name started in tab $T; ack will appear at $ACK"
